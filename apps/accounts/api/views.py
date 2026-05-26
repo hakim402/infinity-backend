@@ -1,327 +1,574 @@
 """
-apps/accounts/api/views.py
-───────────────────────────
-Thin view layer — each view does exactly three things:
-  1. Deserialise & validate input.
-  2. Call a service function.
-  3. Serialise & return the response.
+apps/accounts/views.py
+───────────────────────
+DRF views for every authentication endpoint.
 
-No business logic lives here.
+URL map (see urls.py)
+─────────────────────
+POST   /auth/register/              → RegisterView
+POST   /auth/verify-email/          → VerifyEmailView
+POST   /auth/login/                 → LoginView
+POST   /auth/logout/                → LogoutView
+POST   /auth/token/refresh/         → TokenRefreshView
+POST   /auth/magic-link/request/    → MagicLinkRequestView
+POST   /auth/magic-link/verify/     → MagicLinkVerifyView
+POST   /auth/password-reset/request/  → PasswordResetRequestView
+POST   /auth/password-reset/confirm/  → PasswordResetConfirmView
+POST   /auth/google/                → GoogleOAuthView
+GET    /auth/me/                    → MeView
+PATCH  /auth/me/update/             → UpdateMeView
+POST   /auth/me/change-password/    → ChangePasswordView
+GET    /auth/sessions/              → ActiveSessionsView
+DELETE /auth/sessions/<id>/revoke/  → RevokeSessionView
 """
 
 from __future__ import annotations
 
-import logging
-
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import never_cache
+from drf_spectacular.utils import OpenApiResponse, extend_schema
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.request import Request
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
 from rest_framework.views import APIView
 
-from apps.accounts.api.serializers import (
+from ..models import UserRefreshToken
+from ..permissions import IsClientUser
+from .serializers import (
     ChangePasswordSerializer,
-    ClientRegistrationSerializer,
+    EmailLoginSerializer,
+    EmailVerifySerializer,
+    GoogleOAuthSerializer,
     LogoutSerializer,
     MagicLinkRequestSerializer,
-    RefreshTokenSerializer,
+    MagicLinkVerifySerializer,
+    PasswordResetConfirmSerializer,
+    PasswordResetRequestSerializer,
+    RevokeSessionSerializer,
+    TokenRefreshSerializer,
     UserMeSerializer,
+    UserRegistrationSerializer,
+    UserRefreshTokenSerializer,
     UserUpdateSerializer,
 )
-from apps.accounts.permissions import IsClientUser
-from apps.accounts.services import auth_service, user_service
-
-log = logging.getLogger(__name__)
+from ..services.services import AuthService
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _request_meta(request: Request) -> dict:
-    """
-    Extract IP address and User-Agent from an incoming DRF request.
+def _ok(data: dict | None = None, status_code: int = status.HTTP_200_OK) -> Response:
+    payload = {"success": True}
+    if data:
+        payload.update(data)
+    return Response(payload, status=status_code)
 
-    Handles reverse-proxy deployments (X-Forwarded-For) by taking only the
-    first IP in the header to prevent header-spoofing with comma chains.
+
+def _created(data: dict) -> Response:
+    return _ok(data, status.HTTP_201_CREATED)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. REGISTRATION
+# ──────────────────────────────────────────────────────────────────────────────
+
+@method_decorator(never_cache, name="dispatch")
+class RegisterView(APIView):
     """
-    ip = (
-        request.META.get("HTTP_X_FORWARDED_FOR", "").split(",")[0].strip()
-        or request.META.get("REMOTE_ADDR")
+    POST /auth/register/
+    Create a new CLIENT account and send an email verification link.
+    Throttled to 5 requests/minute (see settings.REST_FRAMEWORK).
+    """
+
+    permission_classes = [AllowAny]
+    throttle_scope     = "registration"
+
+    @extend_schema(
+        request=UserRegistrationSerializer,
+        responses={
+            201: OpenApiResponse(description="User created; verification email sent."),
+            400: OpenApiResponse(description="Validation error."),
+        },
+        summary="Register a new user",
+        tags=["Authentication"],
     )
-    return {
-        "ip_address": ip or None,
-        "user_agent": request.META.get("HTTP_USER_AGENT", ""),
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CUSTOM THROTTLE SCOPES
-# Each scope maps to a rate defined in REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]
-# ──────────────────────────────────────────────────────────────────────────────
-
-class RegistrationThrottle(AnonRateThrottle):
-    """5 registration requests per minute per IP."""
-    scope = "registration"
-
-
-class MagicLinkRequestThrottle(AnonRateThrottle):
-    """5 magic-link requests per minute per IP."""
-    scope = "magic_link_request"
-
-
-class MagicLinkVerifyThrottle(AnonRateThrottle):
-    """20 verify attempts per minute per IP."""
-    scope = "magic_link_verify"
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 0. CLIENT REGISTRATION  —  POST /api/v1/auth/register/
-# ──────────────────────────────────────────────────────────────────────────────
-
-class ClientRegistrationView(APIView):
-    """
-    Register a new client user.
-
-    Creates the User record, generates a MagicLinkToken, and sends a sign-in
-    email via Celery. Returns HTTP 201 with a generic message — no tokens are
-    issued immediately; the user must click the magic link to authenticate.
-
-    Rate limit: 5 requests/minute per IP.
-    """
-
-    permission_classes     = []
-    authentication_classes = []
-    throttle_classes       = [RegistrationThrottle]
-
-    def post(self, request: Request) -> Response:
-        serializer = ClientRegistrationSerializer(data=request.data)
+    def post(self, request):
+        serializer = UserRegistrationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        auth_service.register_client(
-            email=serializer.validated_data["email"],
-            full_name=serializer.validated_data["full_name"],
-        )
+        user = AuthService.register(serializer.validated_data)
 
-        return Response(
-            {
-                "detail": (
-                    "Account created. Please check your email for a sign-in link "
-                    "to verify your address and complete login."
-                )
-            },
-            status=status.HTTP_201_CREATED,
-        )
+        return _created({
+            "message": (
+                "Account created. "
+                "Please check your email to verify your address."
+            ),
+            "user_id": str(user.id),
+            "email":   user.email,
+        })
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1. REQUEST MAGIC LINK  —  POST /api/v1/auth/magic/request/
+# 2. EMAIL VERIFICATION
 # ──────────────────────────────────────────────────────────────────────────────
 
-class MagicLinkRequestView(APIView):
+@method_decorator(never_cache, name="dispatch")
+class VerifyEmailView(APIView):
     """
-    Issue a one-time magic login link for the provided email address.
-
-    Always returns HTTP 200 with a generic message — never reveals whether
-    the email is registered (anti-enumeration protection).
+    POST /auth/verify-email/
+    Accepts the raw token from the verification link.
     """
 
-    permission_classes     = []
-    authentication_classes = []
-    throttle_classes       = [MagicLinkRequestThrottle]
+    permission_classes = [AllowAny]
 
-    def post(self, request: Request) -> Response:
-        serializer = MagicLinkRequestSerializer(data=request.data)
+    @extend_schema(
+        request=EmailVerifySerializer,
+        responses={200: OpenApiResponse(description="Email verified.")},
+        summary="Verify email address",
+        tags=["Authentication"],
+    )
+    def post(self, request):
+        serializer = EmailVerifySerializer(
+            data=request.data, context={"request": request}
+        )
         serializer.is_valid(raise_exception=True)
 
-        auth_service.request_magic_link(
-            email=serializer.validated_data["email"],
-        )
+        ev_token = serializer.context["ev_token"]
+        AuthService.verify_email(ev_token)
 
-        return Response(
-            {"detail": "If an account exists, a link has been sent."},
-            status=status.HTTP_200_OK,
-        )
+        return _ok({"message": "Email verified successfully. You may now log in."})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 2. VERIFY MAGIC LINK  —  GET /api/v1/auth/magic/verify/?token=<raw>
+# 3. EMAIL / PASSWORD LOGIN
 # ──────────────────────────────────────────────────────────────────────────────
 
-class MagicLinkVerifyView(APIView):
+@method_decorator(never_cache, name="dispatch")
+class LoginView(APIView):
     """
-    Exchange a raw magic-link token for a JWT access/refresh pair.
-
-    Accepts the token as a query parameter (GET) so that the frontend can
-    redirect the user directly to this URL after clicking the email link.
-    """
-
-    permission_classes     = []
-    authentication_classes = []
-    throttle_classes       = [MagicLinkVerifyThrottle]
-
-    def get(self, request: Request) -> Response:
-        token = request.query_params.get("token", "").strip()
-
-        if not token or len(token) < 32:
-            return Response(
-                {"detail": "A valid token query parameter is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        result = auth_service.verify_magic_link(
-            raw_token=token,
-            meta=_request_meta(request),
-        )
-
-        return Response(
-            {
-                "access":  result["access"],
-                "refresh": result["refresh"],
-                "user":    UserMeSerializer(result["user"]).data,
-            },
-            status=status.HTTP_200_OK,
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. REFRESH TOKEN  —  POST /api/v1/auth/token/refresh/
-# ──────────────────────────────────────────────────────────────────────────────
-
-class TokenRefreshView(APIView):
-    """
-    Rotate a refresh token and return a new access/refresh pair.
-
-    Extends SimpleJWT's default behaviour with:
-      - Revocation checking against UserRefreshToken.
-      - Device-aware session tracking on rotation.
-      - Escalation to full session wipe on revoked-token replay.
+    POST /auth/login/
+    Returns an access + refresh JWT pair on valid credentials.
     """
 
-    permission_classes     = []
-    authentication_classes = []
-    throttle_classes       = [AnonRateThrottle]
+    permission_classes = [AllowAny]
 
-    def post(self, request: Request) -> Response:
-        serializer = RefreshTokenSerializer(data=request.data)
+    @extend_schema(
+        request=EmailLoginSerializer,
+        responses={
+            200: OpenApiResponse(description="Access + refresh tokens."),
+            400: OpenApiResponse(description="Invalid credentials."),
+        },
+        summary="Email / password login",
+        tags=["Authentication"],
+    )
+    def post(self, request):
+        serializer = EmailLoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        result = auth_service.refresh_access_token(
-            raw_refresh=serializer.validated_data["refresh"],
-            meta=_request_meta(request),
-        )
+        user   = serializer.validated_data["user"]
+        tokens = AuthService.login(user, request)
 
-        return Response(
-            {
-                "access":  result["access"],
-                "refresh": result["refresh"],
-                "user":    UserMeSerializer(result["user"]).data,
-            },
-            status=status.HTTP_200_OK,
-        )
+        return _ok({
+            "message":           "Login successful.",
+            "access":            tokens["access"],
+            "refresh":           tokens["refresh"],
+            "access_expires_at": tokens["access_expires_at"].isoformat(),
+        })
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4. LOGOUT  —  POST /api/v1/auth/logout/
+# 4. LOGOUT
 # ──────────────────────────────────────────────────────────────────────────────
 
+@method_decorator(never_cache, name="dispatch")
 class LogoutView(APIView):
     """
-    Revoke the provided refresh token (current device) or all sessions.
-
-    Requires a valid JWT access token in the Authorization header.
-    Supports an optional `all_devices: true` flag for full session wipe.
+    POST /auth/logout/
+    Revokes the supplied refresh token (session).
     """
 
-    permission_classes = [IsClientUser]
-    throttle_classes   = [UserRateThrottle]
+    permission_classes = [IsAuthenticated]
 
-    def post(self, request: Request) -> Response:
+    @extend_schema(
+        request=LogoutSerializer,
+        responses={200: OpenApiResponse(description="Logged out.")},
+        summary="Logout (revoke session)",
+        tags=["Authentication"],
+    )
+    def post(self, request):
         serializer = LogoutSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        auth_service.logout(
-            user=request.user,
-            raw_refresh=serializer.validated_data["refresh"],
-            all_devices=serializer.validated_data.get("all_devices", False),
-        )
+        AuthService.logout(serializer.validated_data["refresh"], request.user)
 
-        return Response(
-            {"detail": "Successfully logged out."},
-            status=status.HTTP_200_OK,
-        )
+        return _ok({"message": "Logged out successfully."})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5 & 6. CURRENT USER  —  GET + PATCH /api/v1/users/me/
+# 5. TOKEN REFRESH
 # ──────────────────────────────────────────────────────────────────────────────
 
-class UserMeView(APIView):
+@method_decorator(never_cache, name="dispatch")
+class TokenRefreshView(APIView):
     """
-    GET  → Return the authenticated user's full profile.
-    PATCH → Partially update full_name and/or profile fields.
-
-    email and tenant are read-only; any attempt to change them is rejected
-    at the serializer validation level.
+    POST /auth/token/refresh/
+    Exchange a valid refresh token for a new access (+ rotated refresh) token.
     """
 
-    permission_classes = [IsClientUser]
-    throttle_classes   = [UserRateThrottle]
+    permission_classes = [AllowAny]
 
-    def get(self, request: Request) -> Response:
-        user = user_service.get_me(request.user)
-        return Response(
-            UserMeSerializer(user).data,
-            status=status.HTTP_200_OK,
+    @extend_schema(
+        request=TokenRefreshSerializer,
+        responses={200: OpenApiResponse(description="New access token.")},
+        summary="Refresh access token",
+        tags=["Authentication"],
+    )
+    def post(self, request):
+        serializer = TokenRefreshSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        tokens = AuthService.refresh_token(
+            serializer.validated_data["refresh"], request
         )
 
-    def patch(self, request: Request) -> Response:
+        return _ok({
+            "access":            tokens["access"],
+            "refresh":           tokens["refresh"],
+            "access_expires_at": tokens["access_expires_at"].isoformat(),
+        })
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6. MAGIC LINK — REQUEST
+# ──────────────────────────────────────────────────────────────────────────────
+
+@method_decorator(never_cache, name="dispatch")
+class MagicLinkRequestView(APIView):
+    """
+    POST /auth/magic-link/request/
+    Sends a one-time login link to the given email.
+    Always returns 200 to prevent email enumeration.
+    """
+
+    permission_classes = [AllowAny]
+    throttle_scope     = "magic_link_request"
+
+    @extend_schema(
+        request=MagicLinkRequestSerializer,
+        responses={200: OpenApiResponse(description="Magic link sent (if email exists).")},
+        summary="Request passwordless magic link",
+        tags=["Authentication"],
+    )
+    def post(self, request):
+        serializer = MagicLinkRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        AuthService.magic_link_request(serializer.validated_data["email"])
+
+        return _ok({
+            "message": (
+                "If that email is registered you will receive a sign-in link shortly."
+            )
+        })
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7. MAGIC LINK — VERIFY
+# ──────────────────────────────────────────────────────────────────────────────
+
+@method_decorator(never_cache, name="dispatch")
+class MagicLinkVerifyView(APIView):
+    """
+    POST /auth/magic-link/verify/
+    Consumes the token from the magic-link URL and returns a JWT pair.
+    """
+
+    permission_classes = [AllowAny]
+    throttle_scope     = "magic_link_verify"
+
+    @extend_schema(
+        request=MagicLinkVerifySerializer,
+        responses={200: OpenApiResponse(description="Access + refresh tokens.")},
+        summary="Verify magic link token",
+        tags=["Authentication"],
+    )
+    def post(self, request):
+        serializer = MagicLinkVerifySerializer(
+            data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+
+        ml_token = serializer.context["ml_token"]
+        tokens   = AuthService.magic_link_verify(ml_token, request)
+
+        return _ok({
+            "message":           "Login successful.",
+            "access":            tokens["access"],
+            "refresh":           tokens["refresh"],
+            "access_expires_at": tokens["access_expires_at"].isoformat(),
+        })
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8. PASSWORD RESET — REQUEST
+# ──────────────────────────────────────────────────────────────────────────────
+
+@method_decorator(never_cache, name="dispatch")
+class PasswordResetRequestView(APIView):
+    """
+    POST /auth/password-reset/request/
+    Sends a password-reset email.
+    Always returns 200.
+    """
+
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        request=PasswordResetRequestSerializer,
+        responses={200: OpenApiResponse(description="Reset email sent (if exists).")},
+        summary="Request password reset",
+        tags=["Authentication"],
+    )
+    def post(self, request):
+        serializer = PasswordResetRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        AuthService.password_reset_request(serializer.validated_data["email"])
+
+        return _ok({
+            "message": (
+                "If that email is registered you will receive a password-reset link."
+            )
+        })
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 9. PASSWORD RESET — CONFIRM
+# ──────────────────────────────────────────────────────────────────────────────
+
+@method_decorator(never_cache, name="dispatch")
+class PasswordResetConfirmView(APIView):
+    """
+    POST /auth/password-reset/confirm/
+    Validates the reset token and sets the new password.
+    """
+
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        request=PasswordResetConfirmSerializer,
+        responses={200: OpenApiResponse(description="Password updated.")},
+        summary="Confirm password reset",
+        tags=["Authentication"],
+    )
+    def post(self, request):
+        serializer = PasswordResetConfirmSerializer(
+            data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+
+        reset_token  = serializer.context["reset_token"]
+        new_password = serializer.validated_data["password"]
+        AuthService.password_reset_confirm(reset_token, new_password)
+
+        return _ok({"message": "Password updated successfully. Please log in."})
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 10. GOOGLE OAUTH2
+# ──────────────────────────────────────────────────────────────────────────────
+
+@method_decorator(never_cache, name="dispatch")
+class GoogleOAuthView(APIView):
+    """
+    POST /auth/google/
+
+    Next.js integration
+    -------------------
+    1. Install: npm install @react-oauth/google
+    2. Wrap your app in <GoogleOAuthProvider clientId="...">
+    3. Use <GoogleLogin onSuccess={resp => postCredential(resp.credential)} />
+    4. POST { credential: resp.credential } to this endpoint.
+    5. Store the returned access + refresh tokens in httpOnly cookies or
+       a secure state manager.
+
+    This view verifies the Google ID token with Google's public keys and
+    creates/links the User automatically.
+    """
+
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        request=GoogleOAuthSerializer,
+        responses={
+            200: OpenApiResponse(description="Access + refresh tokens."),
+            401: OpenApiResponse(description="Invalid Google credential."),
+        },
+        summary="Google OAuth2 sign-in",
+        tags=["Authentication"],
+    )
+    def post(self, request):
+        serializer = GoogleOAuthSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        tokens = AuthService.google_oauth(
+            serializer.validated_data["credential"], request
+        )
+
+        return _ok({
+            "message":           "Google sign-in successful.",
+            "access":            tokens["access"],
+            "refresh":           tokens["refresh"],
+            "access_expires_at": tokens["access_expires_at"].isoformat(),
+        })
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 11. PROFILE — ME
+# ──────────────────────────────────────────────────────────────────────────────
+
+class MeView(APIView):
+    """
+    GET /auth/me/
+    Returns the authenticated user's full profile.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        responses={200: UserMeSerializer},
+        summary="Get current user profile",
+        tags=["Profile"],
+    )
+    def get(self, request):
+        serializer = UserMeSerializer(request.user)
+        return Response(serializer.data)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 12. PROFILE — UPDATE
+# ──────────────────────────────────────────────────────────────────────────────
+
+class UpdateMeView(APIView):
+    """
+    PATCH /auth/me/update/
+    Partially update the current user's name and/or profile.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        request=UserUpdateSerializer,
+        responses={200: UserMeSerializer},
+        summary="Update current user profile",
+        tags=["Profile"],
+    )
+    def patch(self, request):
         serializer = UserUpdateSerializer(
             request.user,
             data=request.data,
             partial=True,
         )
         serializer.is_valid(raise_exception=True)
+        serializer.save()
 
-        updated_user = user_service.update_me(
-            user=request.user,
-            validated_data=serializer.validated_data,
-        )
-
-        return Response(
-            UserMeSerializer(updated_user).data,
-            status=status.HTTP_200_OK,
-        )
+        return Response(UserMeSerializer(request.user).data)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7. CHANGE PASSWORD  —  POST /api/v1/auth/change-password/
+# 13. CHANGE PASSWORD
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ChangePasswordView(APIView):
     """
-    Allow a client user to set or change their password.
-
-    Magic-link-only users (no usable password) may omit current_password.
-    The new password is validated against Django's AUTH_PASSWORD_VALIDATORS
-    in the serializer before reaching the service layer.
+    POST /auth/me/change-password/
+    Change password while authenticated.  All other sessions are revoked.
     """
 
-    permission_classes = [IsClientUser]
-    throttle_classes   = [UserRateThrottle]
+    permission_classes = [IsAuthenticated]
 
-    def post(self, request: Request) -> Response:
-        serializer = ChangePasswordSerializer(data=request.data)
+    @extend_schema(
+        request=ChangePasswordSerializer,
+        responses={200: OpenApiResponse(description="Password changed.")},
+        summary="Change password",
+        tags=["Profile"],
+    )
+    def post(self, request):
+        serializer = ChangePasswordSerializer(
+            data=request.data,
+            context={"request": request},
+        )
         serializer.is_valid(raise_exception=True)
 
-        auth_service.change_password(
-            user=request.user,
-            current_password=serializer.validated_data.get("current_password", ""),
-            new_password=serializer.validated_data["new_password"],
+        # Pass current refresh so the active session is preserved
+        current_refresh = request.data.get("current_refresh")
+        AuthService.change_password(
+            request.user,
+            serializer.validated_data["new_password"],
+            current_refresh=current_refresh,
         )
 
-        return Response(
-            {"detail": "Password updated successfully."},
-            status=status.HTTP_200_OK,
-        )
+        return _ok({"message": "Password changed successfully."})
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 14. ACTIVE SESSIONS
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ActiveSessionsView(APIView):
+    """
+    GET /auth/sessions/
+    List all non-revoked, non-expired sessions for the current user.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        responses={200: UserRefreshTokenSerializer(many=True)},
+        summary="List active sessions",
+        tags=["Sessions"],
+    )
+    def get(self, request):
+        from django.utils import timezone as tz
+
+        sessions = UserRefreshToken.objects.filter(
+            user=request.user,
+            revoked=False,
+            expires_at__gt=tz.now(),
+        ).order_by("-last_used_at")
+
+        serializer = UserRefreshTokenSerializer(sessions, many=True)
+        return Response({"sessions": serializer.data})
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 15. REVOKE SESSION
+# ──────────────────────────────────────────────────────────────────────────────
+
+class RevokeSessionView(APIView):
+    """
+    DELETE /auth/sessions/<id>/revoke/
+    Revoke a specific session (device logout).
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        responses={200: OpenApiResponse(description="Session revoked.")},
+        summary="Revoke a specific session",
+        tags=["Sessions"],
+    )
+    def delete(self, request, session_id):
+        try:
+            session = UserRefreshToken.objects.get(
+                id=session_id, user=request.user
+            )
+        except UserRefreshToken.DoesNotExist:
+            return Response(
+                {"detail": "Session not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        session.revoke()
+        return _ok({"message": "Session revoked successfully."})

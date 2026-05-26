@@ -1,121 +1,218 @@
+"""
+apps/accounts/admin.py
+───────────────────────
+Unfold-compatible admin registration for all accounts models.
+"""
+
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from unfold.admin import ModelAdmin
-from unfold.forms import AdminPasswordChangeForm, UserChangeForm, UserCreationForm
+from django.utils.translation import gettext_lazy as _
+from unfold.admin import ModelAdmin, TabularInline
+
 from .models import (
-    User, Tenant, UserProfile, MagicLinkToken, EmailVerificationToken,
-    PasswordResetToken, UserRefreshToken, Role, Permission,
-    UserRoleAssignment, UserMFA
+    EmailVerificationToken,
+    MagicLinkToken,
+    PasswordResetToken,
+    Permission,
+    Role,
+    Tenant,
+    User,
+    UserMFA,
+    UserProfile,
+    UserRefreshToken,
+    UserRoleAssignment,
 )
 
-# ------------------------------------------------------------
-# Custom User Admin (Unfold styled)
-# ------------------------------------------------------------
-# Unregister the default User admin (if already registered)
-try:
-    admin.site.unregister(User)
-except admin.sites.NotRegistered:
-    pass
 
-@admin.register(User)
-class UserAdmin(BaseUserAdmin, ModelAdmin):
-    # Use Unfold's forms for proper styling
-    form = UserChangeForm
-    add_form = UserCreationForm
-    change_password_form = AdminPasswordChangeForm
+# ──────────────────────────────────────────────────────────────────────────────
+# INLINES
+# ──────────────────────────────────────────────────────────────────────────────
 
-    list_display = ('email', 'full_name', 'tenant', 'role', 'is_active', 'is_email_verified')
-    list_filter = ('role', 'is_active', 'is_email_verified', 'tenant')
-    search_fields = ('email', 'full_name')
-    ordering = ('email',)
-    
-    # Make auto-generated fields read-only
-    readonly_fields = ('last_login', 'created_at', 'deleted_at')
+class UserProfileInline(TabularInline):
+    model       = UserProfile
+    extra       = 0
+    can_delete  = False
+    verbose_name_plural = _("Profile")
+    fields = [
+        "phone_number", "date_of_birth",
+        "city", "country", "timezone", "language",
+    ]
 
-    fieldsets = (
-        (None, {'fields': ('email', 'full_name', 'password')}),
-        ('Permissions', {
-            'fields': ('role', 'is_active', 'is_staff', 'is_superuser'),
-            'description': 'Roles are assigned via UserRoleAssignment, not here directly.'
-        }),
-        ('Security', {'fields': ('failed_login_attempts', 'locked_until', 'last_login_ip')}),
-        ('Tenant', {'fields': ('tenant',)}),
-        ('Important dates', {'fields': ('last_login', 'created_at', 'deleted_at')}),
-    )
-    
-    add_fieldsets = (
-        (None, {
-            'classes': ('wide',),
-            'fields': ('email', 'full_name', 'password1', 'password2', 'tenant', 'role'),
-        }),
-    )
-    
-    filter_horizontal = ()
-# ------------------------------------------------------------
-# Other ModelAdmins – simply change the base class to ModelAdmin
-# ------------------------------------------------------------
+class UserRoleAssignmentInline(TabularInline):
+    model   = UserRoleAssignment
+    fk_name = "user"
+    extra   = 0
+    fields  = ["role", "assigned_at", "expires_at", "assigned_by"]
+    readonly_fields = ["assigned_at"]
+
+
+class UserRefreshTokenInline(TabularInline):
+    model         = UserRefreshToken
+    extra         = 0
+    can_delete    = False
+    readonly_fields = [
+        "jti", "device_name", "ip_address",
+        "revoked", "last_used_at", "created_at", "expires_at",
+    ]
+    max_num = 10
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TENANT
+# ──────────────────────────────────────────────────────────────────────────────
+
 @admin.register(Tenant)
 class TenantAdmin(ModelAdmin):
-    list_display = ('name', 'slug', 'subscription_tier', 'created_at')
-    search_fields = ('name', 'slug')
-    prepopulated_fields = {'slug': ('name',)}
-    list_filter = ('subscription_tier',)
+    list_display  = ["name", "slug", "subscription_tier", "is_active", "created_at"]
+    list_filter   = ["subscription_tier", "is_active"]
+    search_fields = ["name", "slug"]
+    readonly_fields = ["id", "created_at", "updated_at"]
+    prepopulated_fields = {"slug": ("name",)}
 
-@admin.register(UserProfile)
-class UserProfileAdmin(ModelAdmin):
-    list_display = ('user', 'phone_number', 'city', 'country')
-    search_fields = ('user__email', 'user__full_name', 'phone_number')
-    list_filter = ('country', 'timezone')
 
-@admin.register(MagicLinkToken)
-class MagicLinkTokenAdmin(ModelAdmin):
-    list_display = ('user', 'is_valid', 'expires_at', 'used', 'created_at')
-    list_filter = ('used', 'expires_at')
-    search_fields = ('user__email', 'token_hash')
-    readonly_fields = ('token_hash', 'created_at', 'used_at')
+# ──────────────────────────────────────────────────────────────────────────────
+# USER
+# ──────────────────────────────────────────────────────────────────────────────
 
-@admin.register(EmailVerificationToken)
-class EmailVerificationTokenAdmin(ModelAdmin):
-    list_display = ('user', 'is_valid', 'expires_at', 'used', 'created_at')
-    list_filter = ('used', 'expires_at')
-    search_fields = ('user__email',)
+@admin.register(User)
+class UserAdmin(ModelAdmin):
+    list_display  = [
+        "email", "full_name", "role", "tenant",
+        "is_active", "is_email_verified", "is_locked", "created_at",
+    ]
+    list_filter   = ["role", "is_active", "is_email_verified", "is_staff", "is_superuser"]
+    search_fields = ["email", "full_name"]
+    readonly_fields = [
+        "id", "created_at", "last_login_ip",
+        "failed_login_attempts", "locked_until",
+        "password_last_changed", "deleted_at",
+        "google_sub",
+    ]
+    ordering      = ["-created_at"]
+    inlines       = [UserProfileInline, UserRoleAssignmentInline, UserRefreshTokenInline]
 
-@admin.register(PasswordResetToken)
-class PasswordResetTokenAdmin(ModelAdmin):
-    list_display = ('user', 'is_valid', 'expires_at', 'used', 'created_at')
-    list_filter = ('used', 'expires_at')
-    search_fields = ('user__email',)
+    fieldsets = (
+        (_("Identity"), {
+            "fields": ("id", "email", "full_name", "role", "tenant"),
+        }),
+        (_("Auth"), {
+            "fields": ("password",),
+        }),
+        (_("Google OAuth"), {
+            "fields": ("google_sub", "google_picture_url"),
+            "classes": ("collapse",),
+        }),
+        (_("Permissions"), {
+            "fields": ("is_active", "is_staff", "is_superuser", "is_email_verified"),
+        }),
+        (_("Security"), {
+            "fields": (
+                "last_login_ip", "failed_login_attempts",
+                "locked_until", "password_last_changed",
+            ),
+            "classes": ("collapse",),
+        }),
+        (_("Legal"), {
+            "fields": ("terms_accepted_at", "privacy_accepted_version"),
+            "classes": ("collapse",),
+        }),
+        (_("Audit"), {
+            "fields": ("created_at", "created_by", "deleted_at", "deleted_by"),
+            "classes": ("collapse",),
+        }),
+    )
 
-@admin.register(UserRefreshToken)
-class UserRefreshTokenAdmin(ModelAdmin):
-    list_display = ('user', 'device_name', 'revoked', 'expires_at', 'last_used_at')
-    list_filter = ('revoked', 'expires_at')
-    search_fields = ('user__email', 'device_name', 'jti')
-    readonly_fields = ('jti', 'created_at', 'last_used_at')
+    add_fieldsets = (
+        (None, {
+            "classes": ("wide",),
+            "fields": ("email", "full_name", "role", "tenant", "password1", "password2"),
+        }),
+    )
 
-@admin.register(Role)
-class RoleAdmin(ModelAdmin):
-    list_display = ('name', 'description', 'created_at')
-    search_fields = ('name',)
-    filter_horizontal = ('permissions',)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RBAC
+# ──────────────────────────────────────────────────────────────────────────────
 
 @admin.register(Permission)
 class PermissionAdmin(ModelAdmin):
-    list_display = ('codename', 'name', 'resource_type')
-    search_fields = ('codename', 'name')
-    list_filter = ('resource_type',)
+    list_display  = ["codename", "name", "resource_type"]
+    search_fields = ["codename", "name", "resource_type"]
+    list_filter   = ["resource_type"]
+
+
+@admin.register(Role)
+class RoleAdmin(ModelAdmin):
+    list_display  = ["name", "created_at"]
+    search_fields = ["name"]
+    filter_horizontal = ["permissions"]
+
 
 @admin.register(UserRoleAssignment)
 class UserRoleAssignmentAdmin(ModelAdmin):
-    list_display = ('user', 'role', 'assigned_by', 'assigned_at', 'expires_at', 'is_active')
-    list_filter = ('role', 'expires_at')
-    search_fields = ('user__email', 'role__name')
-    raw_id_fields = ('user', 'assigned_by')
-    readonly_fields = ('assigned_at',)
+    list_display  = ["user", "role", "is_active", "assigned_at", "expires_at"]
+    list_filter   = ["role"]
+    search_fields = ["user__email", "role__name"]
+    readonly_fields = ["assigned_at"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SESSIONS
+# ──────────────────────────────────────────────────────────────────────────────
+
+@admin.register(UserRefreshToken)
+class UserRefreshTokenAdmin(ModelAdmin):
+    list_display  = [
+        "user", "device_name", "ip_address",
+        "revoked", "last_used_at", "expires_at",
+    ]
+    list_filter   = ["revoked"]
+    search_fields = ["user__email", "device_name", "ip_address"]
+    readonly_fields = [
+        "id", "jti", "user", "device_name", "ip_address",
+        "user_agent", "last_used_at", "created_at",
+    ]
+
+    def has_add_permission(self, request):
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TOKENS
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _BaseTokenAdmin(ModelAdmin):
+    list_display    = ["user", "is_valid", "used", "expires_at", "created_at"]
+    readonly_fields = ["id", "token_hash", "user", "used", "used_at", "created_at"]
+    list_filter     = ["used"]
+    search_fields   = ["user__email"]
+
+    def has_add_permission(self, request):
+        return False
+
+
+@admin.register(MagicLinkToken)
+class MagicLinkTokenAdmin(_BaseTokenAdmin):
+    pass
+
+
+@admin.register(EmailVerificationToken)
+class EmailVerificationTokenAdmin(_BaseTokenAdmin):
+    pass
+
+
+@admin.register(PasswordResetToken)
+class PasswordResetTokenAdmin(_BaseTokenAdmin):
+    pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MFA
+# ──────────────────────────────────────────────────────────────────────────────
 
 @admin.register(UserMFA)
 class UserMFAAdmin(ModelAdmin):
-    list_display = ('user', 'method', 'is_active', 'created_at')
-    list_filter = ('method', 'is_active')
-    search_fields = ('user__email',)
-    readonly_fields = ('secret_encrypted', 'backup_codes_hash')
+    list_display  = ["user", "method", "is_active", "created_at"]
+    list_filter   = ["method", "is_active"]
+    search_fields = ["user__email"]
+    readonly_fields = ["id", "user", "secret_encrypted", "created_at", "updated_at"]

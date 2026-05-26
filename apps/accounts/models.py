@@ -1,15 +1,14 @@
 """
 ================================================================================
-  app/accounts/models.py
+  apps/accounts/models.py
   PRODUCTION-READY DJANGO AUTHENTICATION MODELS
-  Multi-Role, Multi-Tenant, Enterprise-Grade
+  Multi-Role, Multi-Tenant, Enterprise-Grade + Google OAuth2
 ================================================================================
-
 """
 from __future__ import annotations
 
 import uuid
-from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
+from django.contrib.auth.models import AbstractBaseUser, BaseUserManager
 from django.db import models
 from django.db.models import Q
 from django.utils import timezone
@@ -21,7 +20,7 @@ from django.utils.translation import gettext_lazy as _
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _uuid_pk() -> models.UUIDField:
-    """Shared UUID primary key definition."""
+    """Shared UUID primary-key definition used across all models."""
     return models.UUIDField(
         primary_key=True,
         default=uuid.uuid4,
@@ -31,15 +30,18 @@ def _uuid_pk() -> models.UUIDField:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1. TENANT MODEL
-# (defined before User so User can reference it)
+# 1. TENANT
 # ──────────────────────────────────────────────────────────────────────────────
 
 class Tenant(models.Model):
     """
-    Represents an isolated organisational unit (company, team, workspace).
-    Every user (except global superusers) belongs to exactly one tenant.
-    All business-data queries must be scoped by tenant.
+    Isolated organisational unit (company / team / workspace).
+
+    Rules
+    -----
+    - Every user except global superusers belongs to exactly one tenant.
+    - All business-data ORM queries MUST be scoped with `.filter(tenant=...)`.
+    - Cascade deletes are blocked via PROTECT on the FK; archive the tenant first.
     """
 
     class SubscriptionTier(models.TextChoices):
@@ -47,9 +49,9 @@ class Tenant(models.Model):
         PRO        = "pro",        _("Pro")
         ENTERPRISE = "enterprise", _("Enterprise")
 
-    id               = _uuid_pk()
-    name             = models.CharField(_("name"), max_length=255)
-    slug             = models.SlugField(
+    id                = _uuid_pk()
+    name              = models.CharField(_("name"), max_length=255)
+    slug              = models.SlugField(
         _("slug"), max_length=100, unique=True,
         help_text=_("URL-safe identifier, e.g. 'acme-corp'."),
     )
@@ -60,9 +62,10 @@ class Tenant(models.Model):
         default=SubscriptionTier.FREE,
         db_index=True,
     )
-    settings         = models.JSONField(_("settings"), default=dict, blank=True)
-    created_at       = models.DateTimeField(_("created at"), auto_now_add=True)
-    updated_at       = models.DateTimeField(_("updated at"), auto_now=True)
+    settings          = models.JSONField(_("settings"), default=dict, blank=True)
+    is_active         = models.BooleanField(_("active"), default=True)
+    created_at        = models.DateTimeField(_("created at"), auto_now_add=True)
+    updated_at        = models.DateTimeField(_("updated at"), auto_now=True)
 
     class Meta:
         ordering     = ["name"]
@@ -79,7 +82,8 @@ class Tenant(models.Model):
 
 class UserManager(BaseUserManager["User"]):
     """
-    Manager that uses email (normalised to lowercase) as the unique identifier.
+    Uses lower-cased email as the unique identifier.
+    Provides extra queryset helpers used throughout the app.
     """
 
     def _create_user(
@@ -128,11 +132,11 @@ class UserManager(BaseUserManager["User"]):
     # ── Queryset helpers ──────────────────────────────────────────────────────
 
     def active(self):
-        """Return only non-deleted, active users."""
+        """Non-deleted, active users only."""
         return self.filter(deleted_at__isnull=True, is_active=True)
 
     def for_tenant(self, tenant: Tenant):
-        """Return all non-deleted users belonging to a specific tenant."""
+        """All non-deleted users for a given tenant."""
         return self.filter(tenant=tenant, deleted_at__isnull=True)
 
 
@@ -142,28 +146,42 @@ class UserManager(BaseUserManager["User"]):
 
 class User(AbstractBaseUser):
     """
-    Central user model for all application types.
+    Central user model.
 
-    Login field : email (case-insensitive)
-    Auth backend: SimpleJWT
-    Soft delete : set deleted_at; the unique email constraint fires only when
-                  deleted_at IS NULL, allowing email re-use after deletion.
+    Key design choices
+    ------------------
+    - Login field    : email (case-insensitive)
+    - Auth backend   : SimpleJWT (access + refresh tokens)
+    - Soft-delete    : sets deleted_at; email uniqueness constraint fires only
+                       when deleted_at IS NULL, so addresses can be reused.
+    - Google OAuth2  : google_sub stores the immutable Google subject claim.
+    - RBAC           : fine-grained permissions via Role → Permission (Section 10).
+    - MFA            : optional TOTP / WebAuthn (Section 11, feature-flagged).
+
+    Roles
+    -----
+    - SUPERADMIN  : Django superuser; bypasses all permission checks.
+    - ADMIN       : Tenant admin; can manage users within their tenant.
+    - CLIENT      : Regular end-user.
     """
 
     class Role(models.TextChoices):
-        ADMIN  = "admin",  _("Admin")
-        CLIENT = "client", _("Client")
+        SUPERADMIN = "superadmin", _("Super Admin")
+        ADMIN      = "admin",      _("Admin")
+        CLIENT     = "client",     _("Client")
 
     # ── Identity ──────────────────────────────────────────────────────────────
     id        = _uuid_pk()
     email     = models.EmailField(
         _("email address"), max_length=255, unique=True, db_index=True,
-        help_text=_("Used as the primary login credential."),
+        help_text=_("Primary login credential — normalised to lowercase."),
     )
     full_name = models.CharField(_("full name"), max_length=255)
     role      = models.CharField(
         _("role"), max_length=20,
-        choices=Role.choices, default=Role.CLIENT, db_index=True,
+        choices=Role.choices,
+        default=Role.CLIENT,
+        db_index=True,
     )
 
     # ── Tenant ────────────────────────────────────────────────────────────────
@@ -171,18 +189,18 @@ class User(AbstractBaseUser):
         Tenant,
         on_delete=models.PROTECT,
         related_name="users",
-        null=True, blank=True,       # NULL only for global superusers
+        null=True, blank=True,          # NULL only for global superusers
         verbose_name=_("tenant"),
         db_index=True,
     )
 
     # ── Permissions / Access ──────────────────────────────────────────────────
-    is_active     = models.BooleanField(_("active"), default=True)
-    is_staff      = models.BooleanField(
+    is_active    = models.BooleanField(_("active"), default=True)
+    is_staff     = models.BooleanField(
         _("staff status"), default=False,
-        help_text=_("Grants access to the Django admin site."),
+        help_text=_("Grants Django admin site access."),
     )
-    is_superuser  = models.BooleanField(
+    is_superuser = models.BooleanField(
         _("superuser"), default=False,
         help_text=_("Bypasses all permission checks."),
     )
@@ -190,16 +208,33 @@ class User(AbstractBaseUser):
     # ── Email verification ────────────────────────────────────────────────────
     is_email_verified = models.BooleanField(_("email verified"), default=False)
 
+    # ── Google OAuth2 ─────────────────────────────────────────────────────────
+    google_sub = models.CharField(
+        _("Google subject ID"),
+        max_length=255,
+        unique=True,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text=_(
+            "Immutable Google account 'sub' claim. "
+            "Set on first Google sign-in; used to locate the user on subsequent logins."
+        ),
+    )
+    google_picture_url = models.URLField(
+        _("Google profile picture URL"), max_length=500, blank=True, default=""
+    )
+
     # ── Security ──────────────────────────────────────────────────────────────
-    last_login_ip        = models.GenericIPAddressField(
+    last_login_ip         = models.GenericIPAddressField(
         _("last login IP"), null=True, blank=True,
     )
     failed_login_attempts = models.PositiveSmallIntegerField(
         _("failed login attempts"), default=0,
     )
-    locked_until         = models.DateTimeField(
+    locked_until          = models.DateTimeField(
         _("locked until"), null=True, blank=True,
-        help_text=_("Account is locked until this datetime."),
+        help_text=_("Account locked until this datetime (UTC)."),
     )
     password_last_changed = models.DateTimeField(
         _("password last changed"), null=True, blank=True,
@@ -214,7 +249,7 @@ class User(AbstractBaseUser):
         max_length=20, null=True, blank=True,
     )
 
-    # ── RBAC ──────────────────────────────────────────────────────────────────
+    # ── RBAC (fine-grained) ───────────────────────────────────────────────────
     roles = models.ManyToManyField(
         "Role",
         through="UserRoleAssignment",
@@ -234,7 +269,7 @@ class User(AbstractBaseUser):
         verbose_name=_("created by"),
     )
 
-    # ── Soft delete ───────────────────────────────────────────────────────────
+    # ── Soft-delete ───────────────────────────────────────────────────────────
     deleted_at = models.DateTimeField(_("deleted at"), null=True, blank=True)
     deleted_by = models.ForeignKey(
         "self",
@@ -251,8 +286,8 @@ class User(AbstractBaseUser):
     objects = UserManager()
 
     class Meta:
-        ordering     = ["-created_at"]
-        verbose_name = _("user")
+        ordering            = ["-created_at"]
+        verbose_name        = _("user")
         verbose_name_plural = _("users")
         indexes = [
             # Fast email look-ups for non-deleted users
@@ -262,15 +297,14 @@ class User(AbstractBaseUser):
                 condition=Q(deleted_at__isnull=True),
             ),
             # Tenant-scoped email look-ups
-            models.Index(
-                fields=["tenant", "email"],
-                name="idx_user_tenant_email",
-            ),
-            # Locked account sweep
-            models.Index(fields=["locked_until"], name="idx_user_locked_until"),
+            models.Index(fields=["tenant", "email"], name="idx_user_tenant_email"),
+            # Locked-account sweep job
+            models.Index(fields=["locked_until"],    name="idx_user_locked_until"),
+            # Role filtering
+            models.Index(fields=["role", "is_active"], name="idx_user_role_active"),
         ]
         constraints = [
-            # Email uniqueness only among non-deleted users
+            # Email uniqueness only among non-deleted rows
             models.UniqueConstraint(
                 fields=["email"],
                 condition=Q(deleted_at__isnull=True),
@@ -278,14 +312,39 @@ class User(AbstractBaseUser):
             ),
         ]
 
-    # ── Django permission helpers (manual, no PermissionsMixin) ───────────────
+    # ── Django permission helpers (manual — no PermissionsMixin) ──────────────
+
     def has_perm(self, perm: str, obj=None) -> bool:
-        return self.is_active and self.is_superuser
+        """
+        Superusers pass everything.
+        All other permission checks should go through the RBAC system.
+        """
+        if not self.is_active:
+            return False
+        if self.is_superuser:
+            return True
+        # Delegate to RBAC: check if any active role grants `perm`
+        return self._has_rbac_perm(perm)
 
     def has_module_perms(self, app_label: str) -> bool:
         return self.is_active and self.is_superuser
 
-    # ── Business helpers ──────────────────────────────────────────────────────
+    def _has_rbac_perm(self, codename: str) -> bool:
+        """
+        Returns True if any active UserRoleAssignment grants a Permission
+        whose codename matches.  Result should be cached in production
+        (e.g. per-request via middleware).
+        """
+        return (
+            self.role_assignments
+            .filter(
+                Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()),
+                role__permissions__codename=codename,
+            )
+            .exists()
+        )
+
+    # ── Convenience properties ────────────────────────────────────────────────
 
     @property
     def is_locked(self) -> bool:
@@ -295,21 +354,42 @@ class User(AbstractBaseUser):
     def is_deleted(self) -> bool:
         return self.deleted_at is not None
 
+    @property
+    def is_oauth_user(self) -> bool:
+        """True when the account was created via Google OAuth (no local password)."""
+        return bool(self.google_sub) and not self.has_usable_password()
+
+    # ── Mutation helpers ──────────────────────────────────────────────────────
+
     def soft_delete(self, deleted_by: "User | None" = None) -> None:
-        self.deleted_at = timezone.now()
+        """
+        Soft-delete: deactivate the account and obfuscate the email so the
+        address can be re-registered.  All fields that are mutated are included
+        in update_fields to avoid accidental overwrites.
+        """
+        now = timezone.now()
+        self.deleted_at = now
         self.deleted_by = deleted_by
         self.is_active  = False
+        # Obfuscate the email so the constraint allows re-use
         self.email = f"deleted_{self.id}_{self.email}"
-        self.save(update_fields=["deleted_at", "deleted_by", "is_active"])
+        self.save(update_fields=["deleted_at", "deleted_by", "is_active", "email"])
 
     def increment_failed_login(self) -> None:
+        """Bump failed-attempt counter; caller is responsible for locking if needed."""
         self.failed_login_attempts += 1
         self.save(update_fields=["failed_login_attempts"])
 
     def reset_failed_login(self) -> None:
+        """Clear failed-attempt counter and any lock."""
         self.failed_login_attempts = 0
         self.locked_until = None
         self.save(update_fields=["failed_login_attempts", "locked_until"])
+
+    def lock_account(self, until: "timezone.datetime") -> None:
+        """Lock account until a specific datetime (UTC)."""
+        self.locked_until = until
+        self.save(update_fields=["locked_until"])
 
     def __str__(self) -> str:
         return f"{self.full_name} <{self.email}>"
@@ -321,8 +401,8 @@ class User(AbstractBaseUser):
 
 class UserProfile(models.Model):
     """
-    Extended demographic and preference data for a User.
-    Created automatically via a post_save signal on User creation.
+    Extended demographic and preference data, kept separate from auth concerns.
+    Created automatically via post_save signal when a User is first saved.
     """
 
     id   = _uuid_pk()
@@ -334,10 +414,9 @@ class UserProfile(models.Model):
     )
 
     # ── Personal information ──────────────────────────────────────────────────
-    date_of_birth  = models.DateField(_("date of birth"), null=True, blank=True)
-    phone_number   = models.CharField(
-        _("phone number"), max_length=30,
-        unique=True, null=True, blank=True,
+    date_of_birth   = models.DateField(_("date of birth"), null=True, blank=True)
+    phone_number    = models.CharField(
+        _("phone number"), max_length=30, unique=True, null=True, blank=True,
     )
     alternate_email = models.EmailField(_("alternate email"), null=True, blank=True)
 
@@ -349,7 +428,7 @@ class UserProfile(models.Model):
     postal_code    = models.CharField(_("postal code"),    max_length=20,  blank=True)
     country        = models.CharField(
         _("country"), max_length=2, blank=True,
-        help_text=_("ISO 3166-1 alpha-2 country code, e.g. 'US', 'GB'."),
+        help_text=_("ISO 3166-1 alpha-2 code, e.g. 'US', 'GB'."),
     )
 
     # ── Media ─────────────────────────────────────────────────────────────────
@@ -357,7 +436,7 @@ class UserProfile(models.Model):
         _("profile picture"),
         upload_to="profile_pictures/%Y/%m/",
         null=True, blank=True,
-        help_text=_("Storage backend (S3/GCS) should be configured via DEFAULT_FILE_STORAGE."),
+        help_text=_("Configure DEFAULT_FILE_STORAGE to use S3/GCS in production."),
     )
     bio = models.TextField(_("bio"), blank=True)
 
@@ -371,8 +450,8 @@ class UserProfile(models.Model):
     updated_at = models.DateTimeField(_("updated at"), auto_now=True)
 
     class Meta:
-        ordering     = ["-created_at"]
-        verbose_name = _("user profile")
+        ordering            = ["-created_at"]
+        verbose_name        = _("user profile")
         verbose_name_plural = _("user profiles")
 
     def __str__(self) -> str:
@@ -381,27 +460,27 @@ class UserProfile(models.Model):
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 5. ABSTRACT BASE TOKEN
-# Shared structure for Magic Link, Email Verification, and Password Reset tokens
 # ──────────────────────────────────────────────────────────────────────────────
 
 class AbstractToken(models.Model):
     """
-    Base class for all single-use, time-limited tokens.
+    Base for all single-use, time-limited tokens (magic link, email verify,
+    password reset).
 
-    SECURITY RULE: Never store the raw token.
-    Store only its SHA-256 hex digest in `token_hash`.
-    Compare by hashing the candidate token before look-up.
+    SECURITY: NEVER store the raw token.
+    Store only its SHA-256 hex digest in token_hash.
+    Hash the candidate before every look-up.
     """
 
     id         = _uuid_pk()
     user       = models.ForeignKey(
         User,
         on_delete=models.CASCADE,
-        related_name="+",    # no reverse accessor on abstract; overridden in subclasses
+        related_name="+",   # concrete subclasses override this
         verbose_name=_("user"),
     )
     token_hash = models.CharField(
-        _("token hash (SHA-256)"), max_length=64,
+        _("SHA-256 token hash"), max_length=64,
         unique=True, db_index=True,
     )
     expires_at = models.DateTimeField(_("expires at"), db_index=True)
@@ -411,22 +490,13 @@ class AbstractToken(models.Model):
 
     class Meta:
         abstract = True
-        indexes = [
-            models.Index(fields=["token_hash"], name="idx_%(class)s_token_hash"),
-            models.Index(fields=["expires_at"], name="idx_%(class)s_expires_at"),
-            # Composite index for cleanup Celery tasks
-            models.Index(fields=["user", "expires_at"], name="idx_%(class)s_user_expires"),
-        ]
-
-    # ── Business helpers ──────────────────────────────────────────────────────
 
     @property
     def is_valid(self) -> bool:
-        """True when the token has not been used and has not expired."""
         return not self.used and self.expires_at > timezone.now()
 
     def consume(self) -> None:
-        """Mark the token as used.  Call inside an atomic block."""
+        """Mark token as used.  Must be called inside an atomic block."""
         if not self.is_valid:
             raise ValueError("Token is already used or has expired.")
         self.used    = True
@@ -439,13 +509,13 @@ class AbstractToken(models.Model):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. MAGIC LINK TOKEN (Passwordless Login)
+# 6. MAGIC LINK TOKEN  (passwordless login)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class MagicLinkToken(AbstractToken):
     """
-    Passwordless login via a one-time URL.
-    Default TTL: MAGIC_LINK_EXPIRY_MINUTES (env, default 15 min).
+    One-time URL for passwordless authentication.
+    TTL: MAGIC_LINK_EXPIRY_MINUTES (env, default 15 min).
     """
 
     user = models.ForeignKey(
@@ -459,8 +529,8 @@ class MagicLinkToken(AbstractToken):
         verbose_name        = _("magic link token")
         verbose_name_plural = _("magic link tokens")
         indexes = [
-            models.Index(fields=["token_hash"], name="idx_magiclink_token_hash"),
-            models.Index(fields=["expires_at"], name="idx_magiclink_expires_at"),
+            models.Index(fields=["token_hash"],      name="idx_magiclink_token_hash"),
+            models.Index(fields=["expires_at"],      name="idx_magiclink_expires_at"),
             models.Index(fields=["user", "expires_at"], name="idx_magiclink_user_expires"),
         ]
 
@@ -471,9 +541,9 @@ class MagicLinkToken(AbstractToken):
 
 class EmailVerificationToken(AbstractToken):
     """
-    Sent on registration (and on email change) to prove ownership.
-    Constraint: at most one *active* token per user.
-    Default TTL: EMAIL_VERIFICATION_EXPIRY_HOURS (env, default 24 h).
+    Sent on registration (and on email change) to prove address ownership.
+    At most ONE active token per user is enforced by the UniqueConstraint.
+    TTL: EMAIL_VERIFICATION_EXPIRY_HOURS (env, default 24 h).
     """
 
     user = models.ForeignKey(
@@ -487,12 +557,11 @@ class EmailVerificationToken(AbstractToken):
         verbose_name        = _("email verification token")
         verbose_name_plural = _("email verification tokens")
         indexes = [
-            models.Index(fields=["token_hash"], name="idx_emailver_token_hash"),
-            models.Index(fields=["expires_at"], name="idx_emailver_expires_at"),
+            models.Index(fields=["token_hash"],         name="idx_emailver_token_hash"),
+            models.Index(fields=["expires_at"],         name="idx_emailver_expires_at"),
             models.Index(fields=["user", "expires_at"], name="idx_emailver_user_expires"),
         ]
         constraints = [
-            # Prevent flooding: only one active token per user
             models.UniqueConstraint(
                 fields=["user"],
                 condition=Q(used=False) & Q(expires_at__gt=timezone.now()),
@@ -507,8 +576,8 @@ class EmailVerificationToken(AbstractToken):
 
 class PasswordResetToken(AbstractToken):
     """
-    Fallback recovery for users who prefer a traditional password.
-    Default TTL: PASSWORD_RESET_EXPIRY_MINUTES (env, default 30 min).
+    Traditional password-reset flow.
+    TTL: PASSWORD_RESET_EXPIRY_MINUTES (env, default 30 min).
     """
 
     user = models.ForeignKey(
@@ -522,43 +591,43 @@ class PasswordResetToken(AbstractToken):
         verbose_name        = _("password reset token")
         verbose_name_plural = _("password reset tokens")
         indexes = [
-            models.Index(fields=["token_hash"], name="idx_pwreset_token_hash"),
-            models.Index(fields=["expires_at"], name="idx_pwreset_expires_at"),
+            models.Index(fields=["token_hash"],         name="idx_pwreset_token_hash"),
+            models.Index(fields=["expires_at"],         name="idx_pwreset_expires_at"),
             models.Index(fields=["user", "expires_at"], name="idx_pwreset_user_expires"),
         ]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 9. REFRESH TOKEN TRACKER (Device-Aware Session Management)
+# 9. REFRESH TOKEN TRACKER  (device-aware session management)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class UserRefreshToken(models.Model):
     """
-    Mirrors every SimpleJWT refresh token so we can revoke individual sessions,
-    list active devices, and detect suspicious concurrent logins.
+    Mirrors every SimpleJWT refresh token so sessions can be individually
+    revoked, active devices listed, and suspicious concurrent logins detected.
 
     Lifecycle
     ---------
-    1. Issue  → create a record when a refresh token is granted.
-    2. Rotate → revoke the old record, create a new one.
+    1. Issue  → create record when refresh token is granted.
+    2. Rotate → revoke old record, create new one.
     3. Logout → set revoked=True.
-    4. Sweep  → Celery periodic task deletes records where expires_at < now().
+    4. Sweep  → Celery task deletes records where expires_at < now().
     """
 
-    id          = _uuid_pk()
-    user        = models.ForeignKey(
+    id         = _uuid_pk()
+    user       = models.ForeignKey(
         User,
         on_delete=models.CASCADE,
         related_name="refresh_tokens",
         verbose_name=_("user"),
     )
-    jti         = models.CharField(
+    jti        = models.CharField(
         _("JWT ID (jti)"), max_length=255,
         unique=True, db_index=True,
         help_text=_("The 'jti' claim from the SimpleJWT refresh token."),
     )
-    expires_at  = models.DateTimeField(_("expires at"), db_index=True)
-    revoked     = models.BooleanField(_("revoked"), default=False, db_index=True)
+    expires_at = models.DateTimeField(_("expires at"), db_index=True)
+    revoked    = models.BooleanField(_("revoked"), default=False, db_index=True)
 
     # ── Device fingerprint ────────────────────────────────────────────────────
     device_name = models.CharField(
@@ -573,11 +642,10 @@ class UserRefreshToken(models.Model):
     created_at   = models.DateTimeField(_("created at"), auto_now_add=True)
 
     class Meta:
-        ordering     = ["-created_at"]
-        verbose_name = _("user refresh token")
+        ordering            = ["-created_at"]
+        verbose_name        = _("user refresh token")
         verbose_name_plural = _("user refresh tokens")
         indexes = [
-            # Primary revocation look-up
             models.Index(
                 fields=["user", "revoked", "expires_at"],
                 name="idx_rftoken_user_rev_exp",
@@ -596,29 +664,29 @@ class UserRefreshToken(models.Model):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10. RBAC — Role & Permission Models
+# 10. RBAC — Permission → Role → UserRoleAssignment
 # ──────────────────────────────────────────────────────────────────────────────
 
 class Permission(models.Model):
     """
-    Fine-grained capability, e.g. 'document:read', 'project:delete'.
-    Assigned to Roles, not directly to users.
+    Fine-grained capability, e.g. 'document:read', 'invoice:approve'.
+    Assigned to Roles, never directly to Users.
     """
 
     id            = _uuid_pk()
     codename      = models.CharField(
         _("codename"), max_length=100, unique=True,
-        help_text=_("Machine-readable identifier, e.g. 'invoice:approve'."),
+        help_text=_("Machine-readable key, e.g. 'project:delete'."),
     )
     name          = models.CharField(_("name"), max_length=255)
     resource_type = models.CharField(
         _("resource type"), max_length=100, blank=True,
-        help_text=_("The type of resource this permission applies to, e.g. 'document'."),
+        help_text=_("Resource this permission applies to, e.g. 'document'."),
     )
 
     class Meta:
-        ordering     = ["resource_type", "codename"]
-        verbose_name = _("permission")
+        ordering            = ["resource_type", "codename"]
+        verbose_name        = _("permission")
         verbose_name_plural = _("permissions")
         indexes = [
             models.Index(fields=["resource_type"], name="idx_permission_resource_type"),
@@ -631,7 +699,7 @@ class Permission(models.Model):
 class Role(models.Model):
     """
     Named collection of Permissions.
-    Assigned to Users via UserRoleAssignment (with optional expiry).
+    Assigned to Users via UserRoleAssignment (supports expiry).
     """
 
     id          = _uuid_pk()
@@ -646,8 +714,8 @@ class Role(models.Model):
     created_at  = models.DateTimeField(_("created at"), auto_now_add=True)
 
     class Meta:
-        ordering     = ["name"]
-        verbose_name = _("role")
+        ordering            = ["name"]
+        verbose_name        = _("role")
         verbose_name_plural = _("roles")
 
     def __str__(self) -> str:
@@ -656,8 +724,8 @@ class Role(models.Model):
 
 class UserRoleAssignment(models.Model):
     """
-    Through model for the User ↔ Role ManyToMany relationship.
-    Supports time-limited role grants (e.g. temporary admin).
+    Through-model for User ↔ Role.
+    Supports time-limited grants (e.g. temporary elevated access).
     """
 
     id          = _uuid_pk()
@@ -687,8 +755,8 @@ class UserRoleAssignment(models.Model):
     )
 
     class Meta:
-        ordering     = ["-assigned_at"]
-        verbose_name = _("user role assignment")
+        ordering            = ["-assigned_at"]
+        verbose_name        = _("user role assignment")
         verbose_name_plural = _("user role assignments")
         constraints = [
             models.UniqueConstraint(
@@ -697,7 +765,10 @@ class UserRoleAssignment(models.Model):
             ),
         ]
         indexes = [
-            models.Index(fields=["user", "expires_at"], name="idx_roleassign_user_expires"),
+            models.Index(
+                fields=["user", "expires_at"],
+                name="idx_roleassign_user_expires",
+            ),
         ]
 
     @property
@@ -710,23 +781,19 @@ class UserRoleAssignment(models.Model):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 11. MFA MODEL (Placeholder for Future Expansion)
-# Activated only when MFA_ENABLED=True in .env
+# 11. MFA  (feature-flagged; table always migrated)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class UserMFA(models.Model):
     """
     Multi-Factor Authentication record.
-
-    Feature flag: set MFA_ENABLED=True in .env to expose MFA endpoints.
-    The model is always migrated so the table exists; activation is app-layer logic.
+    Activate by setting MFA_ENABLED=True in .env.
 
     Security notes
     --------------
-    - `secret_encrypted` must be AES-256 encrypted (use django-cryptography or
-      a dedicated vault such as HashiCorp Vault / AWS Secrets Manager).
-    - `backup_codes_hash` stores individual codes as bcrypt hashes joined by '\n'.
-    - Only one ACTIVE MFA method per user is enforced by the UniqueConstraint.
+    - secret_encrypted : AES-256 encrypted (use django-cryptography or a vault).
+    - backup_codes_hash: bcrypt hashes joined by newline.
+    - At most ONE active method per user (UniqueConstraint).
     """
 
     class Method(models.TextChoices):
@@ -752,18 +819,17 @@ class UserMFA(models.Model):
         _("backup codes hash"), blank=True, null=True,
         help_text=_("Newline-separated bcrypt hashes of one-time backup codes."),
     )
-    created_at        = models.DateTimeField(_("created at"), auto_now_add=True)
-    updated_at        = models.DateTimeField(_("updated at"), auto_now=True)
+    created_at = models.DateTimeField(_("created at"), auto_now_add=True)
+    updated_at = models.DateTimeField(_("updated at"), auto_now=True)
 
     class Meta:
-        ordering     = ["-created_at"]
-        verbose_name = _("user MFA")
+        ordering            = ["-created_at"]
+        verbose_name        = _("user MFA")
         verbose_name_plural = _("user MFA records")
         indexes = [
             models.Index(fields=["user", "is_active"], name="idx_mfa_user_active"),
         ]
         constraints = [
-            # One active MFA method per user
             models.UniqueConstraint(
                 fields=["user"],
                 condition=Q(is_active=True),
@@ -772,16 +838,18 @@ class UserMFA(models.Model):
         ]
 
     def __str__(self) -> str:
-        return f"MFA({self.user}, method={self.get_method_display()}, active={self.is_active})"
+        return (
+            f"MFA({self.user}, method={self.get_method_display()}, "
+            f"active={self.is_active})"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SIGNALS
-# Auto-create UserProfile on User creation
 # ──────────────────────────────────────────────────────────────────────────────
 
 from django.db.models.signals import post_save   # noqa: E402
-from django.dispatch import receiver              # noqa: E402
+from django.dispatch import receiver             # noqa: E402
 
 
 @receiver(post_save, sender=User)
@@ -791,6 +859,6 @@ def create_user_profile(
     created: bool,
     **kwargs,
 ) -> None:
-    """Create a UserProfile automatically whenever a new User is saved."""
+    """Auto-create a UserProfile whenever a new User row is inserted."""
     if created:
         UserProfile.objects.get_or_create(user=instance)

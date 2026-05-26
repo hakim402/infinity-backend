@@ -1,59 +1,62 @@
 """
-apps/accounts/api/urls.py
-──────────────────────────
-URL configuration for the client-facing authentication API.
-Mount this under /api/v1/ in the project's root urls.py:
+apps/accounts/urls.py
+──────────────────────
+URL configuration for the accounts / authentication API.
 
-    path("api/v1/", include("apps.accounts.api.urls", namespace="accounts")),
+All routes live under the prefix configured in config/urls.py.
+Example: if the root urls.py uses path("api/", include("apps.accounts.urls")),
+then the full paths become /api/auth/register/, etc.
 """
 
 from django.urls import path
 
-from apps.accounts.api import views
+from .views import (
+    ActiveSessionsView,
+    ChangePasswordView,
+    GoogleOAuthView,
+    LoginView,
+    LogoutView,
+    MagicLinkRequestView,
+    MagicLinkVerifyView,
+    MeView,
+    PasswordResetConfirmView,
+    PasswordResetRequestView,
+    RegisterView,
+    RevokeSessionView,
+    TokenRefreshView,
+    UpdateMeView,
+    VerifyEmailView,
+)
 
 app_name = "accounts"
 
 urlpatterns = [
-    # ── Registration ──────────────────────────────────────────────────────────
-    path(
-        "auth/register/",
-        views.ClientRegistrationView.as_view(),
-        name="register",
-    ),
+    # ── Registration & verification ─────────────────────────────────────────
+    path("auth/register/",     RegisterView.as_view(),    name="register"),
+    path("auth/verify-email/", VerifyEmailView.as_view(), name="verify-email"),
 
-    # ── Magic Link ────────────────────────────────────────────────────────────
-    path(
-        "auth/magic/request/",
-        views.MagicLinkRequestView.as_view(),
-        name="magic-request",
-    ),
-    path(
-        "auth/magic/verify/",
-        views.MagicLinkVerifyView.as_view(),
-        name="magic-verify",
-    ),
+    # ── Email / password ─────────────────────────────────────────────────────
+    path("auth/login/",          LoginView.as_view(),        name="login"),
+    path("auth/logout/",         LogoutView.as_view(),        name="logout"),
+    path("auth/token/refresh/",  TokenRefreshView.as_view(),  name="token-refresh"),
 
-    # ── Token management ──────────────────────────────────────────────────────
-    path(
-        "auth/token/refresh/",
-        views.TokenRefreshView.as_view(),
-        name="token-refresh",
-    ),
-    path(
-        "auth/logout/",
-        views.LogoutView.as_view(),
-        name="logout",
-    ),
-    path(
-        "auth/change-password/",
-        views.ChangePasswordView.as_view(),
-        name="change-password",
-    ),
+    # ── Magic link ───────────────────────────────────────────────────────────
+    path("auth/magic-link/request/", MagicLinkRequestView.as_view(), name="magic-link-request"),
+    path("auth/magic-link/verify/",  MagicLinkVerifyView.as_view(),  name="magic-link-verify"),
 
-    # ── User profile ──────────────────────────────────────────────────────────
-    path(
-        "users/me/",
-        views.UserMeView.as_view(),
-        name="me",
-    ),
+    # ── Password reset ────────────────────────────────────────────────────────
+    path("auth/password-reset/request/", PasswordResetRequestView.as_view(), name="password-reset-request"),
+    path("auth/password-reset/confirm/", PasswordResetConfirmView.as_view(), name="password-reset-confirm"),
+
+    # ── Google OAuth2 ─────────────────────────────────────────────────────────
+    path("auth/google/", GoogleOAuthView.as_view(), name="google-oauth"),
+
+    # ── Profile ───────────────────────────────────────────────────────────────
+    path("auth/me/",                MeView.as_view(),             name="me"),
+    path("auth/me/update/",         UpdateMeView.as_view(),        name="me-update"),
+    path("auth/me/change-password/", ChangePasswordView.as_view(), name="change-password"),
+
+    # ── Sessions ──────────────────────────────────────────────────────────────
+    path("auth/sessions/",                      ActiveSessionsView.as_view(),                name="sessions"),
+    path("auth/sessions/<uuid:session_id>/revoke/", RevokeSessionView.as_view(),             name="session-revoke"),
 ]
