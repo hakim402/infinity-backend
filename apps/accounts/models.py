@@ -172,9 +172,12 @@ class User(AbstractBaseUser):
 
     # ── Identity ──────────────────────────────────────────────────────────────
     id        = _uuid_pk()
-    email     = models.EmailField(
-        _("email address"), max_length=255, unique=True, db_index=True,
-        help_text=_("Primary login credential — normalised to lowercase."),
+    email = models.EmailField(
+    _("email address"),
+    max_length=255,
+    unique=True,
+    db_index=True,
+    help_text=_("Primary login credential — normalised to lowercase."),
     )
     full_name = models.CharField(_("full name"), max_length=255)
     role      = models.CharField(
@@ -286,32 +289,20 @@ class User(AbstractBaseUser):
     objects = UserManager()
 
     class Meta:
-        ordering            = ["-created_at"]
-        verbose_name        = _("user")
+        ordering = ["-created_at"]
+        verbose_name = _("user")
         verbose_name_plural = _("users")
         indexes = [
-            # Fast email look-ups for non-deleted users
             models.Index(
                 fields=["email"],
                 name="idx_user_email_active",
                 condition=Q(deleted_at__isnull=True),
             ),
-            # Tenant-scoped email look-ups
             models.Index(fields=["tenant", "email"], name="idx_user_tenant_email"),
-            # Locked-account sweep job
-            models.Index(fields=["locked_until"],    name="idx_user_locked_until"),
-            # Role filtering
+            models.Index(fields=["locked_until"], name="idx_user_locked_until"),
             models.Index(fields=["role", "is_active"], name="idx_user_role_active"),
         ]
-        constraints = [
-            # Email uniqueness only among non-deleted rows
-            models.UniqueConstraint(
-                fields=["email"],
-                condition=Q(deleted_at__isnull=True),
-                name="uq_user_email_not_deleted",
-            ),
-        ]
-
+    
     # ── Django permission helpers (manual — no PermissionsMixin) ──────────────
 
     def has_perm(self, perm: str, obj=None) -> bool:
@@ -560,13 +551,6 @@ class EmailVerificationToken(AbstractToken):
             models.Index(fields=["token_hash"],         name="idx_emailver_token_hash"),
             models.Index(fields=["expires_at"],         name="idx_emailver_expires_at"),
             models.Index(fields=["user", "expires_at"], name="idx_emailver_user_expires"),
-        ]
-        constraints = [
-            models.UniqueConstraint(
-                fields=["user"],
-                condition=Q(used=False) & Q(expires_at__gt=timezone.now()),
-                name="uq_emailver_one_active_per_user",
-            ),
         ]
 
 

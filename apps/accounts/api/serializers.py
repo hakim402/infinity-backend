@@ -1,5 +1,5 @@
 """
-apps/accounts/serializers.py
+apps/accounts/api/serializers.py
 ─────────────────────────────
 DRF serializers for every authentication and profile endpoint.
 
@@ -20,11 +20,9 @@ Covers
 from __future__ import annotations
 
 import hashlib
-import secrets
 from datetime import timedelta
 
 from django.conf import settings
-from django.contrib.auth import authenticate
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -111,12 +109,12 @@ class EmailLoginSerializer(serializers.Serializer):
         email    = data["email"].lower().strip()
         password = data["password"]
 
+        invalid_credentials = "Invalid email or password."
+
         try:
             user = User.objects.get(email=email, deleted_at__isnull=True)
         except User.DoesNotExist:
-            raise serializers.ValidationError(
-                "No account found with this email address."
-            )
+            raise serializers.ValidationError(invalid_credentials)
 
         if not user.is_active:
             raise serializers.ValidationError("This account has been deactivated.")
@@ -136,7 +134,7 @@ class EmailLoginSerializer(serializers.Serializer):
                 user.lock_account(
                     until=timezone.now() + timedelta(minutes=lock_minutes)
                 )
-            raise serializers.ValidationError("Incorrect password.")
+            raise serializers.ValidationError(invalid_credentials)
 
         if not user.is_email_verified:
             raise serializers.ValidationError(
@@ -414,6 +412,9 @@ class ChangePasswordSerializer(serializers.Serializer):
     new_password_confirm = serializers.CharField(
         write_only=True,
         style={"input_type": "password"},
+    )
+    current_refresh = serializers.CharField(
+        write_only=True, required=False, allow_blank=True
     )
 
     def validate(self, data: dict) -> dict:

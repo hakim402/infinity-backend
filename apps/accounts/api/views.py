@@ -1,5 +1,5 @@
 """
-apps/accounts/views.py
+apps/accounts/api/views.py
 ───────────────────────
 DRF views for every authentication endpoint.
 
@@ -33,7 +33,6 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..models import UserRefreshToken
-from ..permissions import IsClientUser
 from .serializers import (
     ChangePasswordSerializer,
     EmailLoginSerializer,
@@ -502,7 +501,7 @@ class ChangePasswordView(APIView):
         serializer.is_valid(raise_exception=True)
 
         # Pass current refresh so the active session is preserved
-        current_refresh = request.data.get("current_refresh")
+        current_refresh = serializer.validated_data.get("current_refresh")
         AuthService.change_password(
             request.user,
             serializer.validated_data["new_password"],

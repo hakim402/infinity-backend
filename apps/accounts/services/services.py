@@ -33,7 +33,6 @@ from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.mail import send_mail
 from django.db import transaction
-from django.template.loader import render_to_string
 from django.utils import timezone
 from rest_framework.exceptions import AuthenticationFailed, ValidationError
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -194,6 +193,11 @@ class AuthService:
         token_hash = _sha256(raw_token)
         expires_at = timezone.now() + timedelta(
             hours=settings.EMAIL_VERIFICATION_EXPIRY_HOURS
+        )
+
+        # Invalidate previous active verification tokens for this user.
+        EmailVerificationToken.objects.filter(user=user, used=False).update(
+            used=True, used_at=timezone.now()
         )
 
         EmailVerificationToken.objects.create(
@@ -544,12 +548,13 @@ class AuthService:
 
         try:
             refresh = RefreshToken(refresh_token_str)
-            jti     = str(refresh.get("jti", ""))
-            UserRefreshToken.objects.filter(
-                user=user, jti=jti
-            ).update(revoked=True)
-        except (TokenError, Exception) as exc:
-            logger.warning("Logout token error for user %s: %s", user.email, exc)
+        except TokenError as exc:
+            raise AuthenticationFailed(f"Invalid refresh token: {exc}")
+
+        jti = str(refresh.get("jti", ""))
+        updated = UserRefreshToken.objects.filter(user=user, jti=jti).update(revoked=True)
+        if not updated:
+            raise AuthenticationFailed("Session not found for this user.")
 
         logger.info("User logged out: %s", user.email)
 
@@ -579,12 +584,13 @@ class AuthService:
         # Revoke all sessions except the current one
         qs = UserRefreshToken.objects.filter(user=user, revoked=False)
         if current_refresh:
+            from rest_framework_simplejwt.exceptions import TokenError
             try:
                 refresh = RefreshToken(current_refresh)
                 jti     = str(refresh.get("jti", ""))
                 qs = qs.exclude(jti=jti)
-            except Exception:
-                pass
+            except TokenError as exc:
+                raise AuthenticationFailed(f"Invalid current refresh token: {exc}")
         qs.update(revoked=True)
 
         logger.info("Password changed for user %s", user.email)
