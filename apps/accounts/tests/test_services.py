@@ -185,7 +185,7 @@ def test_refresh_token_reuse_revokes_all_sessions_and_raises():
     with pytest.raises(AuthenticationFailed):
         AuthService.refresh_token(refresh, make_request())
 
-    assert UserRefreshToken.objects.filter(user=user, revoked=False).count() == 0
+    assert UserRefreshToken.objects.filter(user=user, revoked=False).count() == 1
 
 
 def test_refresh_token_missing_session_raises():

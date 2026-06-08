@@ -27,7 +27,7 @@ def api_client():
 
 
 @patch("apps.accounts.services.services._send_email")
-def test_register_endpoint(api_client, mock_send_email, settings):
+def test_register_endpoint(mock_send_email, api_client, settings):
     settings.EMAIL_VERIFICATION_EXPIRY_HOURS = 24
 
     response = api_client.post(
@@ -140,7 +140,7 @@ def test_token_refresh_endpoint_rotates_refresh_token(api_client):
 
 
 @patch("apps.accounts.services.services._send_email")
-def test_magic_link_request_endpoint_always_returns_200(api_client, mock_send_email, settings):
+def test_magic_link_request_endpoint_always_returns_200(mock_send_email, api_client, settings):
     settings.MAGIC_LINK_EXPIRY_MINUTES = 15
     settings.FRONTEND_BASE_URL = "https://frontend.test"
     create_user(email="magic-api@example.com")
@@ -177,7 +177,7 @@ def test_magic_link_verify_endpoint_returns_tokens(api_client):
 
 
 @patch("apps.accounts.services.services._send_email")
-def test_password_reset_request_endpoint_always_returns_200(api_client, mock_send_email, settings):
+def test_password_reset_request_endpoint_always_returns_200(mock_send_email, api_client, settings):
     settings.PASSWORD_RESET_EXPIRY_MINUTES = 30
     settings.FRONTEND_BASE_URL = "https://frontend.test"
     create_user(email="reset-api@example.com")
